@@ -14,6 +14,18 @@ from logging import NullHandler
 from . import exceptions
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
+from ._policy import (
+    DEFAULT_PROFILE,
+    PolicyProfile,
+    ProxyRoute,
+    RedirectSurface,
+    RetryBudget,
+    StatusForce,
+    current_policy,
+    policy_scope,
+    pop_policy,
+    push_policy,
+)
 from ._version import __version__
 from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
@@ -54,18 +66,28 @@ __all__ = (
     "HTTPHeaderDict",
     "HTTPSConnectionPool",
     "PoolManager",
+    "PolicyProfile",
     "ProxyManager",
+    "ProxyRoute",
     "HTTPResponse",
+    "RedirectSurface",
     "Retry",
+    "RetryBudget",
+    "StatusForce",
     "Timeout",
     "add_stderr_logger",
     "connection_from_url",
+    "current_policy",
     "disable_warnings",
     "encode_multipart_formdata",
     "make_headers",
+    "policy_scope",
+    "pop_policy",
     "proxy_from_url",
+    "push_policy",
     "request",
     "BaseHTTPResponse",
+    "DEFAULT_PROFILE",
 )
 
 logging.getLogger(__name__).addHandler(NullHandler())

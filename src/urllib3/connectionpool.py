@@ -12,6 +12,16 @@ from types import TracebackType
 
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
+from ._policy import (
+    ProxyRoute,
+    change_method_on_redirect,
+    current_proxy_route,
+    follow_redirects_allowed,
+    policy_increment,
+    proxy_bypass_unavailable_error,
+    status_retry_decision,
+    tunnel_denied_error,
+)
 from ._request_methods import RequestMethods
 from .connection import (
     BaseSSLError,
@@ -733,16 +743,32 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         # [1] <https://github.com/urllib3/urllib3/issues/651>
         release_this_conn = release_conn
 
+        # The proxy_route dimension is consulted live at this egress decision
+        # point; profiles pushed after an earlier hop already flew only apply
+        # to subsequent hops/recursions.
+        proxy_route = current_proxy_route()
         http_tunnel_required = connection_requires_http_tunnel(
             self.proxy, self.proxy_config, destination_scheme
         )
+
+        if self.proxy is not None:
+            if http_tunnel_required and proxy_route is ProxyRoute.DENY_TUNNEL:
+                # Refuse rather than silently downgrade while still looking
+                # like the pinned tunnel path.
+                raise tunnel_denied_error(url)
+            if proxy_route is ProxyRoute.BYPASS_PROXY:
+                # A direct (proxy-less) pool never reaches this branch; a pool
+                # constructed with a proxy cannot truthfully dial the target
+                # directly, so fail instead of sending traffic to the proxy.
+                raise proxy_bypass_unavailable_error()
 
         # Merge the proxy headers. Only done when not using HTTP CONNECT. We
         # have to copy the headers dict so we can safely change it without those
         # changes being reflected in anyone else's copy.
         if not http_tunnel_required:
             headers = headers.copy()  # type: ignore[attr-defined]
-            headers.update(self.proxy_headers)  # type: ignore[union-attr]
+            if proxy_route is not ProxyRoute.BYPASS_PROXY:
+                headers.update(self.proxy_headers)  # type: ignore[union-attr]
 
         # Must keep the exception bound to a separate variable or else Python 3
         # complains about UnboundLocalError.
@@ -833,8 +859,17 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             elif isinstance(new_e, (OSError, HTTPException)):
                 new_e = ProtocolError("Connection aborted.", new_e)
 
-            retries = retries.increment(
-                method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
+            # The retry_budget dimension is read at the failure decision
+            # point, so a frame pushed while the recursive urlopen is already
+            # in flight is taken into account by the next decision instead of
+            # reusing an entry snapshot.
+            retries = policy_increment(
+                retries,
+                method,
+                url,
+                error=new_e,
+                pool=self,
+                stacktrace=sys.exc_info()[2],
             )
             retries.sleep()
 
@@ -890,11 +925,15 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 **response_kw,
             )
 
-        # Handle redirect?
+        # Handle redirect? The redirect_surface dimension is read live here:
+        # deny hands the 3xx back to the caller even when redirect=True and
+        # Retry.redirect is still positive, while the method/body decision is
+        # shared with PoolManager's cross-host follower.
         redirect_location = redirect and response.get_redirect_location()
-        if redirect_location:
-            if response.status == 303:
-                # Change the method according to RFC 9110, Section 15.4.4.
+        if redirect_location and follow_redirects_allowed():
+            if change_method_on_redirect(response.status):
+                # Pinned behavior on 303 (RFC 9110, Section 15.4.4), or
+                # force_get_on_3xx for any followed redirect status.
                 method = "GET"
                 # And lose the body not to transfer anything sensitive.
                 body = None
@@ -918,7 +957,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 headers = new_headers
 
             try:
-                retries = retries.increment(method, url, response=response, _pool=self)
+                retries = policy_increment(
+                    retries, method, url, response=response, pool=self
+                )
             except MaxRetryError:
                 if retries.raise_on_redirect:
                     response.drain_conn()
@@ -927,6 +968,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
             response.drain_conn()
             retries.sleep_for_retry(response)
+            # Re-read the surface after the drain/sleep: a frame pushed
+            # while the hop was already being prepared must invalidate this
+            # pending recursion rather than reuse the entry decision.
+            if not follow_redirects_allowed():
+                return response
             log.debug("Redirecting %s -> %s", url, redirect_location)
             return self.urlopen(
                 method,
@@ -950,7 +996,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         has_retry_after = bool(response.headers.get("Retry-After"))
         if retries.is_retry(method, response.status, has_retry_after):
             try:
-                retries = retries.increment(method, url, response=response, _pool=self)
+                retries = policy_increment(
+                    retries, method, url, response=response, pool=self
+                )
             except MaxRetryError:
                 if retries.raise_on_status:
                     response.drain_conn()
@@ -959,6 +1007,14 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
             response.drain_conn()
             retries.sleep(response)
+            # Recompute the policy decision against the live stack (without
+            # re-reading counters already incremented): a status_force frame
+            # pushed while the retry was being prepared invalidates the
+            # earlier is_retry()=True decision.
+            if not status_retry_decision(
+                retries, method, response.status, has_retry_after
+            ):
+                return response
             log.debug("Retry: %s", url)
             return self.urlopen(
                 method,
@@ -1049,6 +1105,15 @@ class HTTPSConnectionPool(HTTPConnectionPool):
 
     def _prepare_proxy(self, conn: HTTPSConnection) -> None:  # type: ignore[override]
         """Establishes a tunnel connection through HTTP CONNECT."""
+        # Read the proxy_route dimension at the tunnel decision point. A
+        # frame pushed after a previous tunnel succeeded only applies to the
+        # next decision; there is no silent downgrade on the current one.
+        proxy_route = current_proxy_route()
+        if proxy_route is ProxyRoute.DENY_TUNNEL:
+            raise tunnel_denied_error(_url_from_pool(self))
+        if proxy_route is ProxyRoute.BYPASS_PROXY and self.proxy is not None:
+            raise proxy_bypass_unavailable_error()
+
         if self.proxy and self.proxy.scheme == "https":
             tunnel_scheme = "https"
         else:

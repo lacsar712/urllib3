@@ -437,19 +437,40 @@ class Retry:
         respect the Retry-After header, whether this header is present, and
         whether the returned status code is on the list of status codes to
         be retried upon on the presence of the aforementioned header)
+
+        The status_force dimension of the thread-local policy stack
+        (:mod:`urllib3._policy`) is consulted live on every call; pushing a
+        frame after an earlier decision returned True therefore takes effect
+        on the next decision rather than being decided from a stale snapshot.
         """
-        if not self._is_method_retryable(method):
+        from .._policy import (
+            StatusForce,
+            status_force_policy,
+            status_retry_decision,
+        )
+
+        force_policy = status_force_policy()
+
+        # Policy-only decision (status_force dimension); it deliberately
+        # does not account for the total counter so it can be replayed
+        # after increment() while a pending recursion is being prepared.
+        if not status_retry_decision(
+            self, method, status_code, has_retry_after
+        ):
             return False
 
-        if self.status_forcelist and status_code in self.status_forcelist:
-            return True
+        # The forcelist fork and the force_all_5xx override are "strong"
+        # decisions that fire even with total == 0 (increment then ends the
+        # chain via exhaustion). The Retry-After fork, as in the pin, still
+        # needs a positive total.
+        if force_policy is StatusForce.FORCE_ALL_5XX:
+            if 500 <= status_code <= 599:
+                return True
+        elif force_policy is StatusForce.HONOR_FORCELIST:
+            if self.status_forcelist and status_code in self.status_forcelist:
+                return True
 
-        return bool(
-            self.total
-            and self.respect_retry_after_header
-            and has_retry_after
-            and (status_code in self.RETRY_AFTER_STATUS_CODES)
-        )
+        return bool(self.total)
 
     def is_exhausted(self) -> bool:
         """Are we out of retries?"""

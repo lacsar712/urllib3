@@ -8,6 +8,14 @@ from types import TracebackType
 from urllib.parse import urljoin
 
 from ._collections import HTTPHeaderDict, RecentlyUsedContainer
+from ._policy import (
+    ProxyRoute,
+    change_method_on_redirect,
+    current_proxy_route,
+    follow_redirects_allowed,
+    policy_increment,
+    tunnel_denied_error,
+)
 from ._request_methods import RequestMethods
 from .connection import ProxyConfig
 from .connectionpool import (
@@ -433,6 +441,27 @@ class PoolManager(RequestMethods):
             self.proxy, self.proxy_config, parsed_url.scheme
         )
 
+    def _direct_connection_from_url(self, u: Url) -> HTTPConnectionPool:
+        """Select a pool dialing the target directly, with no proxy context.
+
+        Used by the ``bypass_proxy`` profile on a ``ProxyManager``: pool keys
+        include the proxy context, so the bypass pool is distinct from any
+        cached proxy pool and neither ``self.proxy`` nor the manager's pool
+        configuration is mutated. The grandparent implementation is used to
+        skip ``ProxyManager.connection_from_host`` host rewriting.
+        """
+        return PoolManager.connection_from_host(
+            self,
+            u.host,
+            port=u.port,
+            scheme=u.scheme,
+            pool_kwargs={
+                "_proxy": None,
+                "_proxy_headers": None,
+                "_proxy_config": None,
+            },
+        )
+
     def urlopen(  # type: ignore[override]
         self, method: str, url: str, redirect: bool = True, **kw: typing.Any
     ) -> BaseHTTPResponse:
@@ -456,7 +485,14 @@ class PoolManager(RequestMethods):
                 stacklevel=2,
             )
 
-        conn = self.connection_from_host(u.host, port=u.port, scheme=u.scheme)
+        # proxy_route is read live for every urlopen, including redirect
+        # recursions, so a frame pushed mid-chain is re-evaluated on the next
+        # hop rather than inherited from an entry snapshot.
+        proxy_route = current_proxy_route()
+        if self.proxy is not None and proxy_route is ProxyRoute.BYPASS_PROXY:
+            conn = self._direct_connection_from_url(u)
+        else:
+            conn = self.connection_from_host(u.host, port=u.port, scheme=u.scheme)
 
         kw["assert_same_host"] = False
         kw["redirect"] = False
@@ -464,7 +500,11 @@ class PoolManager(RequestMethods):
         if "headers" not in kw:
             kw["headers"] = self.headers
 
-        if self._proxy_requires_url_absolute_form(u):
+        use_absolute_form = proxy_route is ProxyRoute.FORCE_ABSOLUTE_FORM or (
+            self._proxy_requires_url_absolute_form(u)
+            and proxy_route is not ProxyRoute.BYPASS_PROXY
+        )
+        if use_absolute_form:
             # Strip the fragment here but let the connection pool normalize the URL
             # to avoid decoding IPv6 zone identifiers twice.
             response = conn.urlopen(method, url.split("#", 1)[0], **kw)
@@ -475,11 +515,18 @@ class PoolManager(RequestMethods):
         if not redirect_location:
             return response
 
+        # Same redirect_surface dimension as the same-pool follower; deny
+        # hands the 3xx back to the caller even with redirect=True and a
+        # positive Retry.redirect.
+        if not follow_redirects_allowed():
+            return response
+
         # Support relative URLs for redirecting.
         redirect_location = urljoin(url, redirect_location)
 
-        if response.status == 303:
-            # Change the method according to RFC 9110, Section 15.4.4.
+        if change_method_on_redirect(response.status):
+            # Pinned behavior on 303 (RFC 9110, Section 15.4.4), or
+            # force_get_on_3xx for any followed redirect status.
             method = "GET"
             # And lose the body not to transfer anything sensitive.
             kw["body"] = None
@@ -513,7 +560,11 @@ class PoolManager(RequestMethods):
             kw["headers"] = new_headers
 
         try:
-            retries = retries.increment(method, url, response=response, _pool=conn)
+            # retry_budget (notably freeze_counts) applies to cross-host hops
+            # exactly as it does to same-pool hops.
+            retries = policy_increment(
+                retries, method, url, response=response, pool=conn
+            )
         except MaxRetryError:
             if retries.raise_on_redirect:
                 response.drain_conn()
@@ -523,10 +574,14 @@ class PoolManager(RequestMethods):
         kw["retries"] = retries
         kw["redirect"] = redirect
 
-        log.info("Redirecting %s -> %s", url, redirect_location)
-
         response.drain_conn()
         retries.sleep_for_retry(response)
+        # Re-read after drain/sleep so a frame pushed while the cross-host
+        # hop was being prepared invalidates the pending recursion instead
+        # of keeping the entry-time decision.
+        if not follow_redirects_allowed():
+            return response
+        log.info("Redirecting %s -> %s", url, redirect_location)
         return self.urlopen(method, redirect_location, **kw)
 
 
@@ -683,6 +738,21 @@ class ProxyManager(PoolManager):
     ) -> BaseHTTPResponse:
         "Same as HTTP(S)ConnectionPool.urlopen, ``url`` must be absolute."
         u = parse_url(url)
+        proxy_route = current_proxy_route()
+
+        if proxy_route is ProxyRoute.DENY_TUNNEL and connection_requires_http_tunnel(
+            self.proxy, self.proxy_config, u.scheme
+        ):
+            # Fail loudly instead of silently downgrading while the egress
+            # still looks like the pinned tunnel path.
+            raise tunnel_denied_error(url)
+
+        if proxy_route is ProxyRoute.BYPASS_PROXY:
+            # No proxy headers, no CONNECT: PoolManager.urlopen selects a
+            # direct pool. self.proxy is left untouched and redirect hops
+            # re-read the same profile on their own urlopen recursion.
+            return super().urlopen(method, url, redirect=redirect, **kw)
+
         if not connection_requires_http_tunnel(self.proxy, self.proxy_config, u.scheme):
             # For connections using HTTP CONNECT, httplib sets the necessary
             # headers on the CONNECT to the proxy. If we're not using CONNECT,
