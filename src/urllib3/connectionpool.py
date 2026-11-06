@@ -10,6 +10,7 @@ import weakref
 from socket import timeout as SocketTimeout
 from types import TracebackType
 
+from . import response_policy as _response_policy
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
 from ._request_methods import RequestMethods
@@ -339,6 +340,47 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         # Connection never got put back into the pool, close it.
         if conn:
             conn.close()
+
+    def _apply_response_policy_return(
+        self,
+        conn: BaseHTTPConnection | None,
+        response: BaseHTTPResponse | None,
+    ) -> bool:
+        """
+        Apply the response-phase runtime ``conn_return`` policy at the
+        ``urlopen`` cleanup chokepoint.
+
+        Returns ``True`` when the connection followed the pinned put-back
+        path (``_put_conn``, including the ``conn is None`` refill case), and
+        ``False`` when a pushed policy frame kept it out of the pool
+        (``keep_out``) or forced its socket to be torn down (``force_drop``).
+
+        The frame is resolved at the actual handoff moment, never cached from
+        when the request entered; ``handle_conn_return`` re-checks it and
+        refuses explicitly if it changed in between.
+        """
+        conn_return, frame = _response_policy.current_conn_return()
+        if frame is None or conn_return == _response_policy.CONN_HONOR_CFG:
+            self._put_conn(conn)
+            return True
+
+        if conn is None:
+            # Error paths already closed and nulled the connection; all that
+            # remains is the pinned None refill.
+            self._put_conn(conn)
+            return True
+
+        _response_policy.handle_conn_return(
+            frame, conn_return, self, conn, source="urlopen"
+        )
+        if conn_return == _response_policy.CONN_KEEP_OUT and response is not None:
+            # Transfer observable ownership of the occupied connection to
+            # the response -- the same ownership shape used by
+            # ``preload_content=False`` / ``release_conn=False``. It is
+            # genuinely not in the pool, so the next request opens a new
+            # connection instead of faking success from an empty pool.
+            response._connection = conn  # type: ignore[attr-defined]
+        return False
 
     def _validate_conn(self, conn: BaseHTTPConnection) -> None:
         """
@@ -733,6 +775,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         # [1] <https://github.com/urllib3/urllib3/issues/651>
         release_this_conn = release_conn
 
+        # Set when the response-phase policy stack (keep_out/force_drop)
+        # redirected the connection return in ``finally``. Withheld/dropped
+        # conns are not a broken-connection retry signal.
+        conn_withheld = False
+
         http_tunnel_required = connection_requires_http_tunnel(
             self.proxy, self.proxy_config, destination_scheme
         )
@@ -852,13 +899,21 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                     conn = None
                 release_this_conn = True
 
-            if release_this_conn:
-                # Put the connection back to be reused. If the connection is
-                # expired then it will be None, which will get replaced with a
-                # fresh connection during _get_conn.
-                self._put_conn(conn)
+            # Put the connection back to be reused. If the connection is
+            # expired then it will be None, which will get replaced with a
+            # fresh connection during _get_conn. A pushed response-policy
+            # frame may redirect this return (keep_out/force_drop).
+            # "response" is bound by _make_request only on a clean exit; look
+            # it up dynamically so the error paths don't narrow its type.
+            response_for_return: typing.Any = (
+                locals().get("response") if clean_exit else None
+            )
+            if release_this_conn and not self._apply_response_policy_return(
+                conn, response_for_return
+            ):
+                conn_withheld = True
 
-        if not conn:
+        if not conn and not conn_withheld:
             # Try again
             log.warning(
                 "Retrying (%r) after connection broken by '%r': %s",

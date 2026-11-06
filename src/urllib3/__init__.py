@@ -19,6 +19,7 @@ from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
 from .poolmanager import PoolManager, ProxyManager, proxy_from_url
 from .response import BaseHTTPResponse, HTTPResponse
+from .response_policy import ResponsePolicyFrame, active_response_policy
 from .util.request import make_headers
 from .util.retry import Retry
 from .util.timeout import Timeout
@@ -66,6 +67,8 @@ __all__ = (
     "proxy_from_url",
     "request",
     "BaseHTTPResponse",
+    "ResponsePolicyFrame",
+    "active_response_policy",
 )
 
 logging.getLogger(__name__).addHandler(NullHandler())

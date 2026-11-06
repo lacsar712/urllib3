@@ -26,6 +26,7 @@ try:
 except ImportError:
     brotli = None
 
+from . import response_policy as _response_policy
 from . import util
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
@@ -41,6 +42,7 @@ from .exceptions import (
     ProtocolError,
     ReadTimeoutError,
     ResponseNotChunked,
+    ResponsePolicyError,
     SSLError,
 )
 from .util.response import is_fp_closed, is_response_to_head
@@ -565,7 +567,8 @@ class BaseHTTPResponse(io.IOBase):
 
         :returns: The body of the HTTP response as a Python object.
         """
-        data = self.data.decode("utf-8")
+        with _response_policy.body_fetch(self):
+            data = self.data.decode("utf-8")
         return _json.loads(data)
 
     @property
@@ -826,7 +829,26 @@ class HTTPResponse(BaseHTTPResponse):
         if not self._pool or not self._connection:
             return None
 
-        self._pool._put_conn(self._connection)
+        conn = self._connection
+        conn_return, frame = _response_policy.current_conn_return()
+        if frame is not None and conn_return != _response_policy.CONN_HONOR_CFG:
+            _response_policy.handle_conn_return(
+                frame,
+                conn_return,
+                self._pool,
+                conn,
+                source="release_conn",
+            )
+            # keep_out: the connection stays occupied on this response and
+            # is not handed back to the pool. force_drop: its socket has been
+            # torn down; the (closed) reference is retained so the drop and
+            # any still-held buffered data stay observable. Repeated calls
+            # while the same frame is on top keep the disposition stable.
+            # Either way the permanent configuration was not mutated and no
+            # pool state was touched.
+            return
+
+        self._pool._put_conn(conn)
         self._connection = None
 
     def drain_conn(self) -> None:
@@ -946,6 +968,14 @@ class HTTPResponse(BaseHTTPResponse):
         try:
             try:
                 yield
+
+            except ResponsePolicyError:
+                # A response-policy refusal (e.g. body_admit='deny_new' /
+                # exhausted 'one_more') is not a transport failure. The
+                # connection is healthy, so do not tear it down nor return it
+                # to the pool: treat the exit as clean and propagate.
+                clean_exit = True
+                raise
 
             except SocketTimeout as e:
                 # FIXME: Ideally we'd like to include the url in the ReadTimeoutError but
@@ -1125,9 +1155,27 @@ class HTTPResponse(BaseHTTPResponse):
             after having ``.read()`` the file object. (Overridden if ``amt`` is
             set.)
         """
-        self._init_decoder()
-        if decode_content is None:
-            decode_content = self.decode_content
+        with _response_policy.body_fetch(self):
+            return self._read_impl(
+                amt,
+                decode_content=decode_content,
+                cache_content=cache_content,
+            )
+
+    def _read_impl(
+        self,
+        amt: int | None = None,
+        decode_content: bool | None = None,
+        cache_content: bool = False,
+    ) -> bytes:
+        decode_content, decode_gate = _response_policy.resolve_decode_content(
+            self, decode_content
+        )
+        if decode_gate == _response_policy.DECODE_HONOR_CFG:
+            # Pinned behaviour: initialize the decoder up front regardless of
+            # the per-call decode decision. A frame that forces raw bytes
+            # skips the decoder path entirely instead.
+            self._init_decoder()
 
         if amt and amt < 0:
             # Negative numbers and `None` should be treated the same.
@@ -1224,8 +1272,17 @@ class HTTPResponse(BaseHTTPResponse):
             If True, will attempt to decode the body based on the
             'content-encoding' header.
         """
-        if decode_content is None:
-            decode_content = self.decode_content
+        with _response_policy.body_fetch(self):
+            return self._read1_impl(amt, decode_content=decode_content)
+
+    def _read1_impl(
+        self,
+        amt: int | None = None,
+        decode_content: bool | None = None,
+    ) -> bytes:
+        decode_content, _decode_gate = _response_policy.resolve_decode_content(
+            self, decode_content
+        )
         if amt and amt < 0:
             # Negative numbers and `None` should be treated the same.
             amt = None
@@ -1332,7 +1389,22 @@ class HTTPResponse(BaseHTTPResponse):
             self._fp.close()
 
         if self._connection:
-            self._connection.close()
+            # Closing the response is one of the connection-return surfaces.
+            # The conn_return gate applies here too: keep_out leaves the
+            # connection occupied (socket untouched, not pooled); force_drop
+            # observably tears the socket down via handle_conn_return();
+            # honor_cfg keeps the pinned behaviour of closing it outright.
+            conn_return, frame = _response_policy.current_conn_return()
+            if frame is not None and conn_return != _response_policy.CONN_HONOR_CFG:
+                _response_policy.handle_conn_return(
+                    frame,
+                    conn_return,
+                    self._pool,
+                    self._connection,
+                    source="close",
+                )
+            else:
+                self._connection.close()
 
         if not self.auto_close:
             io.IOBase.close(self)
@@ -1442,7 +1514,10 @@ class HTTPResponse(BaseHTTPResponse):
             If True, will attempt to decode the body based on the
             'content-encoding' header.
         """
-        self._init_decoder()
+        if _response_policy.current_decode_gate() == _response_policy.DECODE_HONOR_CFG:
+            # Pinned behaviour is to initialize the decoder up front; a
+            # frame that forces raw bytes never touches the decoder path.
+            self._init_decoder()
         # FIXME: Rewrite this method and make it a class with a better structured logic.
         if not self.chunked:
             raise ResponseNotChunked(
@@ -1476,23 +1551,41 @@ class HTTPResponse(BaseHTTPResponse):
             while True:
                 # First, check if any data is left in the decoder's buffer.
                 if self._decoder and self._decoder.has_unconsumed_tail:
+                    # Continued decoding of bytes already fetched: not a new
+                    # wire fetch, so the body_admit gate is not re-entered.
                     chunk = b""
                 else:
-                    self._update_chunk_length()
-                    self._uncached_read_occurred = True
-                    if self.chunk_left == 0:
-                        break
-                    chunk = self._handle_chunk(amt)
+                    # Every wire chunk is a *new* body fetch: the gate is
+                    # re-read from the then-current top frame for each one,
+                    # so a deny_new/one_more frame pushed mid-stream fails
+                    # observably here instead of reporting a complete body.
+                    _policy_frame = _response_policy.begin_body_fetch(self)
+                    try:
+                        self._update_chunk_length()
+                        self._uncached_read_occurred = True
+                        if self.chunk_left == 0:
+                            break
+                        chunk = self._handle_chunk(amt)
+                    finally:
+                        _response_policy.end_body_fetch(self, _policy_frame)
+                # Pinned chunked streaming treats decode_content=None as raw;
+                # none_default=False reproduces that when the stack is empty.
+                chunk_decode, _ = _response_policy.resolve_decode_content(
+                    self, decode_content, none_default=False
+                )
                 decoded = self._decode(
                     chunk,
-                    decode_content=decode_content,
+                    decode_content=chunk_decode,
                     flush_decoder=False,
                     max_length=amt,
                 )
                 if decoded:
                     yield decoded
 
-            if decode_content:
+            flush_decode, _ = _response_policy.resolve_decode_content(
+                self, decode_content, none_default=False
+            )
+            if flush_decode:
                 # On CPython and PyPy, we should never need to flush the
                 # decoder. However, on Jython we *might* need to, so
                 # lets defensively do it anyway.

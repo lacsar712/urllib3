@@ -9,7 +9,7 @@ from http.client import IncompleteRead as httplib_IncompleteRead
 if typing.TYPE_CHECKING:
     from .connection import HTTPConnection
     from .connectionpool import ConnectionPool
-    from .response import HTTPResponse
+    from .response import BaseHTTPResponse, HTTPResponse
     from .util.retry import Retry
 
 # Base Exceptions
@@ -333,3 +333,52 @@ class HeaderParsingError(HTTPError):
 
 class UnrewindableBodyError(HTTPError):
     """urllib3 encountered an error when trying to rewind a body"""
+
+
+class ResponsePolicyError(HTTPError):
+    """
+    Base class for violations of the response-phase runtime policy stack
+    (:mod:`urllib3.response_policy`).
+
+    These errors are produced by *pushed policy frames*, never by the
+    permanent ``preload_content``/``decode_content``/``auto_close``
+    configuration.
+    """
+
+
+class BodyAdmissionDenied(ResponsePolicyError):
+    """
+    Raised when the current response-policy frame refuses to admit a new
+    response-body fetch (``body_admit='deny_new'`` or an exhausted
+    ``body_admit='one_more'``) at the entry of ``read()``/``read1()``/
+    ``stream()``/``json()``.
+
+    A body fetch that was already in flight when the frame was pushed is
+    never cancelled or rewritten to an empty success; only fetches that
+    enter *after* the push are denied.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        frame: object,
+        mode: str,
+        response: BaseHTTPResponse | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.frame = frame
+        self.mode = mode
+        self.response = response
+
+
+class ConnReturnFrameChanged(ResponsePolicyError):
+    """
+    Raised when a connection-return action observes a different policy frame
+    at the actual handoff point than the one resolved when the return entered.
+    The return is then refused rather than silently applying a stale frame.
+    """
+
+    def __init__(self, message: str, *, expected_frame: object) -> None:
+        super().__init__(message)
+        self.expected_frame = expected_frame
